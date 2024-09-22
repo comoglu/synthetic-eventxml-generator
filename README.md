@@ -44,7 +44,7 @@ This tool generates synthetic seismic event data in SeisComp XML format, useful 
 
 1. Clone the repository:
    ```
-   git clone git@github.com:comoglu/seiscomp-eventxml-generator.git
+   git clone git@github.com:comoglu/synthetic-eventxml-generator.git
    ```
 2. Navigate to the project directory:
    ```
