@@ -78,7 +78,7 @@ Refer to the provided `config.ini` for an example configuration.
 To generate a synthetic event, run:
 
 ```
-seiscomp-python seiscomp-eventxml-generator-v2.py config.ini inventory.xml
+seiscomp-python seiscomp-eventxml-generator.py config.ini inventory.xml
 ```
 
 This will create a SeisComP XML file containing the synthetic event based on the parameters in `config.ini`.
