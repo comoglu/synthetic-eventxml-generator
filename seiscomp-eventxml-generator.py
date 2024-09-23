@@ -625,7 +625,7 @@ def create_synthetic_event(config, seiscomp_config_file):
     if config['Event']['time'].lower() == 'now':
         event_time = core.Time.GMT()
     else:
-        event_time = core.Time.FromString(config['Event']['time'])
+        event_time = core.Time.FromString(config['Event']['time'], "%FT%T%Z")
 
     py_event_time = seiscomp_time_to_datetime(event_time)
 
