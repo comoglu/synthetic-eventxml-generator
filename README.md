@@ -54,7 +54,7 @@ This tool generates synthetic seismic event data in SeisComp XML format, useful 
    ```
    pip install numpy configparser requests obspy folium PyQt5
    ```
-4. Ensure SeisComp3 is installed and its Python libraries are in your Python path.
+4. Ensure SeisComP is installed and its Python libraries are in your Python path.
 
 ## Configuration
 
