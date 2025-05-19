@@ -14,36 +14,288 @@ from obspy.taup import TauPyModel
 from obspy.geodetics import locations2degrees, degrees2kilometers
 import xml.etree.ElementTree as ET
 import argparse
+import logging
+import os
+from typing import List, Dict, Tuple, Any, Optional, Union
 
-def create_resource_id(agency_id, id_string):
+# Set up logging
+def setup_logging():
+    logger = logging.getLogger('seismic_generator')
+    logger.setLevel(logging.INFO)
+    
+    # Console handler
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    
+    # File handler
+    fh = logging.FileHandler('seismic_generator.log')
+    fh.setLevel(logging.DEBUG)
+    
+    # Formatter
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    ch.setFormatter(formatter)
+    fh.setFormatter(formatter)
+    
+    logger.addHandler(ch)
+    logger.addHandler(fh)
+    
+    return logger
+
+logger = setup_logging()
+
+class ConfigManager:
+    def __init__(self, config_file='config.ini'):
+        self.config_file = config_file
+        self.config = self.load_config()
+        
+    def load_config(self):
+        config = configparser.ConfigParser()
+        config.optionxform = str  # Preserve case
+        if os.path.exists(self.config_file):
+            config.read(self.config_file)
+            logger.info(f"Loaded configuration from {self.config_file}")
+        else:
+            logger.warning(f"Configuration file {self.config_file} not found, using defaults")
+            self.create_default_config(config)
+        return config
+    
+    def create_default_config(self, config):
+        # Set sensible defaults
+        config['Event'] = {
+            'latitude': '0.0',
+            'longitude': '0.0',
+            'depth': '10.0',
+            'time': 'now',
+            'type': 'EARTHQUAKE'
+        }
+        config['Inventory'] = {
+            'path': 'inventory.xml',
+            'min_distance': '0.0',
+            'max_distance': '180.0'
+        }
+        config['Noise'] = {
+            'pick_time_std': '0.1',
+            'station_magnitude_std': '0.2'
+        }
+        config['Agency'] = {
+            'id': 'TEST',
+            'id_lowercase': 'test'
+        }
+        config['Uncertainties'] = {
+            'origin_latitude': '0.1',
+            'origin_longitude': '0.1',
+            'origin_depth': '5.0'
+        }
+        config['Phases'] = {
+            's_wave_cutoff': '105.0'
+        }
+        config['Magnitudes'] = {
+            'Mww': '8.7, 9.1, 9.3',
+            'ML': '6.5',
+            'mb': '7.0',
+            'mB': '7.5'
+        }
+        config['MultipleOrigins'] = {
+            'number_of_origins': '3',
+            'initial_station_count': '10',
+            'station_increase_per_origin': '5',
+            'creation_time_increment': '60.0'
+        }
+        config['QualityParameters'] = {
+            'standard_error': '0.5',
+            'secondary_azimuthal_gap': '60.0',
+            'ground_truth_level': 'GT5',
+            'maximum_distance': '90.0',
+            'minimum_distance': '0.0',
+            'median_distance': '45.0'
+        }
+        config['FocalMechanism'] = {
+            'count': '1',
+            'strike1_1': '300.0',
+            'dip1_1': '15.0',
+            'rake1_1': '90.0',
+            'strike2_1': '120.0',
+            'dip2_1': '75.0',
+            'rake2_1': '90.0'
+        }
+        config['FDSN'] = {
+            'url': 'http://localhost:8081/fdsnws/station/1/query'
+        }
+        return config
+        
+    def save_config(self):
+        with open(self.config_file, 'w') as f:
+            self.config.write(f)
+            logger.info(f"Saved configuration to {self.config_file}")
+        
+    def get_config(self):
+        return self.config
+
+def create_resource_id(agency_id: str, id_string: str) -> str:
+    """
+    Create a resource ID string in SeisComp format.
+    
+    Args:
+        agency_id: The agency identifier
+        id_string: The resource identifier string
+        
+    Returns:
+        Formatted resource ID
+    """
     return f"smi:{agency_id.lower()}/{id_string}"
 
-def parse_config_xml(config_file):
-    tree = ET.parse(config_file)
-    root = tree.getroot()
+def parse_config_xml(config_file: str) -> List[Dict[str, str]]:
+    """
+    Parse the SeisComp configuration XML file to extract station information.
     
+    Args:
+        config_file: Path to the SeisComp configuration XML file
+        
+    Returns:
+        List of dictionaries containing network and station codes
+    """
     stations = []
-    namespace = {'sc': 'http://geofon.gfz-potsdam.de/ns/seiscomp3-schema/0.12'}
+    try:
+        tree = ET.parse(config_file)
+        root = tree.getroot()
+        
+        namespace = {'sc': 'http://geofon.gfz-potsdam.de/ns/seiscomp3-schema/0.12'}
+        
+        for parameterSet in root.findall('.//sc:parameterSet', namespace):
+            publicID = parameterSet.get('publicID', '')
+            if publicID.startswith('ParameterSet/trunk/Station/'):
+                parts = publicID.split('/')
+                if len(parts) >= 5:
+                    network = parts[3]
+                    station = parts[4]
+                    stations.append({
+                        "network": network,
+                        "station": station
+                    })
+        
+        logger.info(f"Parsed {len(stations)} stations from configuration XML")
+        return stations
+    except Exception as e:
+        logger.error(f"Error parsing configuration XML: {e}")
+        return []
+
+def filter_stations_by_distance(stations: List[Dict[str, Any]], max_distance: float) -> List[Dict[str, Any]]:
+    """
+    Filter stations based on distance from event.
     
-    for parameterSet in root.findall('.//sc:parameterSet', namespace):
-        publicID = parameterSet.get('publicID', '')
-        if publicID.startswith('ParameterSet/trunk/Station/'):
-            parts = publicID.split('/')
-            if len(parts) >= 5:
-                network = parts[3]
-                station = parts[4]
-                stations.append({
-                    "network": network,
-                    "station": station
-                })
+    Args:
+        stations: List of station dictionaries with distance information
+        max_distance: Maximum distance in degrees
+        
+    Returns:
+        Filtered list of stations within the maximum distance
+    """
+    filtered = [station for station in stations if station['distance'] <= max_distance]
+    logger.debug(f"Filtered {len(filtered)} stations within {max_distance} degrees from {len(stations)} total stations")
+    return filtered
+
+def load_stations_from_inventory(inventory_path: str, event_latitude: float, event_longitude: float, 
+                               max_distance: float) -> List[Dict[str, Any]]:
+    """
+    Load station information from the inventory XML file.
     
-    return stations
+    Args:
+        inventory_path: Path to the inventory XML file
+        event_latitude: Event latitude in degrees
+        event_longitude: Event longitude in degrees
+        max_distance: Maximum distance in degrees
+        
+    Returns:
+        List of station dictionaries with coordinates and calculated distances
+    """
+    stations = []
+    try:
+        tree = ET.parse(inventory_path)
+        root = tree.getroot()
+        namespace = {'sc': 'http://geofon.gfz-potsdam.de/ns/seiscomp3-schema/0.12'}
+        
+        # First try to find networks and stations in SeisComp XML format
+        for network in root.findall('.//sc:network', namespace):
+            net_code = network.get('code')
+            for station in network.findall('.//sc:station', namespace):
+                sta_code = station.get('code')
+                lat_elem = station.find('.//sc:latitude', namespace)
+                lon_elem = station.find('.//sc:longitude', namespace)
+                elev_elem = station.find('.//sc:elevation', namespace)
+                
+                if lat_elem is not None and lon_elem is not None:
+                    lat = float(lat_elem.text)
+                    lon = float(lon_elem.text)
+                    elev = float(elev_elem.text) if elev_elem is not None else 0.0
+                    
+                    distance = locations2degrees(event_latitude, event_longitude, lat, lon)
+                    if distance <= max_distance:
+                        azimuth = sc_math.delazi(event_latitude, event_longitude, lat, lon)[1]
+                        
+                        stations.append({
+                            "code": sta_code,
+                            "network": net_code,
+                            "latitude": lat,
+                            "longitude": lon,
+                            "elevation": elev,
+                            "distance": distance,
+                            "azimuth": azimuth
+                        })
+        
+        # If no stations found with SC schema, try standard QuakeML/FDSN schema
+        if not stations:
+            for network in root.findall('.//network'):
+                net_code = network.get('code')
+                for station in network.findall('.//station'):
+                    sta_code = station.get('code')
+                    lat_elem = station.find('./latitude')
+                    lon_elem = station.find('./longitude')
+                    elev_elem = station.find('./elevation')
+                    
+                    if lat_elem is not None and lon_elem is not None:
+                        lat = float(lat_elem.text)
+                        lon = float(lon_elem.text)
+                        elev = float(elev_elem.text) if elev_elem is not None else 0.0
+                        
+                        distance = locations2degrees(event_latitude, event_longitude, lat, lon)
+                        if distance <= max_distance:
+                            azimuth = sc_math.delazi(event_latitude, event_longitude, lat, lon)[1]
+                            
+                            stations.append({
+                                "code": sta_code,
+                                "network": net_code,
+                                "latitude": lat,
+                                "longitude": lon,
+                                "elevation": elev,
+                                "distance": distance,
+                                "azimuth": azimuth
+                            })
+        
+        logger.info(f"Loaded {len(stations)} stations from inventory file within {max_distance} degrees")
+        if stations:
+            logger.info(f"Station distances range from {min([s['distance'] for s in stations]):.2f} to {max([s['distance'] for s in stations]):.2f} degrees")
+        else:
+            logger.warning("No stations found in inventory file within the specified distance")
+        
+        return sorted(stations, key=lambda x: x['distance'])
+    except Exception as e:
+        logger.error(f"Error loading stations from inventory: {e}")
+        return []
 
-def filter_stations_by_distance(stations, max_distance):
-    return [station for station in stations if station['distance'] <= max_distance]
-
-
-def load_stations(config, event_latitude, event_longitude, configured_stations):
+def load_stations_from_fdsnws(config: configparser.ConfigParser, event_latitude: float, event_longitude: float, 
+                            configured_stations: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+    """
+    Load station information from FDSNWS service.
+    
+    Args:
+        config: Configuration parameters
+        event_latitude: Event latitude in degrees
+        event_longitude: Event longitude in degrees
+        configured_stations: List of configured stations from parse_config_xml
+        
+    Returns:
+        List of station dictionaries with coordinates and calculated distances
+    """
     fdsn_url = config.get('FDSN', 'url', fallback='http://localhost:8081/fdsnws/station/1/query')
     max_distance = float(config['QualityParameters']['maximum_distance'])
     params = {
@@ -56,6 +308,7 @@ def load_stations(config, event_latitude, event_longitude, configured_stations):
         'nodata': '404'
     }
     try:
+        logger.info(f"Fetching station data from FDSNWS: {fdsn_url}")
         response = requests.get(fdsn_url, params=params)
         response.raise_for_status()
         csv_reader = csv.reader(StringIO(response.text), delimiter='|')
@@ -77,23 +330,58 @@ def load_stations(config, event_latitude, event_longitude, configured_stations):
                         "distance": distance,
                         "azimuth": azimuth
                     })
-        print(f"Loaded {len(stations)} configured stations within {max_distance} degrees from FDSN web service.")
+        logger.info(f"Loaded {len(stations)} configured stations within {max_distance} degrees from FDSN web service")
         if stations:
-            print(f"Station distances range from {min([s['distance'] for s in stations]):.2f} to {max([s['distance'] for s in stations]):.2f} degrees.")
+            logger.info(f"Station distances range from {min([s['distance'] for s in stations]):.2f} to {max([s['distance'] for s in stations]):.2f} degrees")
         else:
-            print("Warning: No stations were loaded. Check your station inventory and FDSN web service.")
+            logger.warning("No stations were loaded from FDSNWS. Check your station inventory and FDSN web service.")
         return sorted(stations, key=lambda x: x['distance'])
     except requests.RequestException as e:
-        print(f"Error fetching data from FDSN web service: {e}")
+        logger.error(f"Error fetching data from FDSN web service: {e}")
         return []
-    
-def load_config(config_file):
-    config = configparser.ConfigParser()
-    config.optionxform = str  # This preserves the case of the keys
-    config.read(config_file)
-    return config
 
-def generate_event_id(agency_id_lowercase, event_time):
+def load_stations(config: configparser.ConfigParser, event_latitude: float, event_longitude: float, 
+                configured_stations: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+    """
+    Load station information, first from inventory file, then FDSNWS if needed.
+    
+    Args:
+        config: Configuration parameters
+        event_latitude: Event latitude in degrees
+        event_longitude: Event longitude in degrees
+        configured_stations: List of configured stations from parse_config_xml
+        
+    Returns:
+        List of station dictionaries with coordinates and calculated distances
+    """
+    # First try to load stations from inventory file
+    inventory_path = config.get('Inventory', 'path', fallback='inventory.xml')
+    max_distance = float(config['QualityParameters']['maximum_distance'])
+    
+    logger.info(f"Attempting to load stations from inventory file: {inventory_path}")
+    stations = load_stations_from_inventory(inventory_path, event_latitude, event_longitude, max_distance)
+    
+    # If inventory file doesn't provide enough stations, try FDSNWS as fallback
+    if not stations and config.get('FDSN', 'url', fallback=''):
+        logger.info("No stations loaded from inventory, attempting to use FDSNWS")
+        stations = load_stations_from_fdsnws(config, event_latitude, event_longitude, configured_stations)
+        
+    if not stations:
+        logger.warning("No stations could be loaded from inventory or FDSNWS")
+        
+    return stations
+
+def generate_event_id(agency_id_lowercase: str, event_time: datetime.datetime) -> str:
+    """
+    Generate a unique event ID based on agency and time.
+    
+    Args:
+        agency_id_lowercase: Lowercase agency ID
+        event_time: Event time as datetime object
+        
+    Returns:
+        Generated event ID string
+    """
     current_year = event_time.year
     year_start = datetime.datetime(current_year, 1, 1)
     year_fraction = (event_time - year_start).total_seconds() / (366 * 24 * 60 * 60)
@@ -101,11 +389,34 @@ def generate_event_id(agency_id_lowercase, event_time):
     letters = ''.join(string.ascii_lowercase[(letter_value // (26**i)) % 26] for i in range(5, -1, -1))
     return f"{agency_id_lowercase}{current_year}{letters}"
 
-def seiscomp_time_to_datetime(sc_time):
+def seiscomp_time_to_datetime(sc_time: core.Time) -> datetime.datetime:
+    """
+    Convert SeisComp time to Python datetime.
+    
+    Args:
+        sc_time: SeisComp time object
+        
+    Returns:
+        Python datetime object
+    """
     return datetime.datetime.strptime(sc_time.toString("%Y-%m-%d %H:%M:%S.%f"), "%Y-%m-%d %H:%M:%S.%f")
 
-
-def create_pick(origin, station, distance_km, phase, config, depth_km):
+def create_pick(origin: datamodel.Origin, station: Dict[str, Any], distance_km: float, phase: str, 
+              config: configparser.ConfigParser, depth_km: float) -> Optional[datamodel.Pick]:
+    """
+    Create a seismic phase pick for a station.
+    
+    Args:
+        origin: Origin object
+        station: Station dictionary
+        distance_km: Distance in kilometers
+        phase: Phase code (e.g., 'P', 'S')
+        config: Configuration parameters
+        depth_km: Event depth in kilometers
+        
+    Returns:
+        Created Pick object or None if creation fails
+    """
     pick = datamodel.Pick.Create()
     model = TauPyModel(model="iasp91")
     
@@ -114,11 +425,11 @@ def create_pick(origin, station, distance_km, phase, config, depth_km):
                                           distance_in_degree=station['distance'],
                                           phase_list=[phase])
     except Exception as e:
-        print(f"Error in TauPyModel for station {station['code']}, phase {phase}: {str(e)}")
+        logger.error(f"Error in TauPyModel for station {station['code']}, phase {phase}: {str(e)}")
         return None
     
     if not arrivals:
-        print(f"No arrivals found for station {station['code']}, phase {phase}")
+        logger.warning(f"No arrivals found for station {station['code']}, phase {phase}")
         return None
     
     travel_time = arrivals[0].time
@@ -146,7 +457,22 @@ def create_pick(origin, station, distance_km, phase, config, depth_km):
     pick.setCreationInfo(creation_info)
     return pick
 
-def create_arrival(pick, distance_deg, azimuth, phase, config, theoretical_time):
+def create_arrival(pick: datamodel.Pick, distance_deg: float, azimuth: float, phase: str, 
+                 config: configparser.ConfigParser, theoretical_time: core.Time) -> datamodel.Arrival:
+    """
+    Create an arrival for a pick.
+    
+    Args:
+        pick: Pick object
+        distance_deg: Distance in degrees
+        azimuth: Azimuth in degrees
+        phase: Phase code
+        config: Configuration parameters
+        theoretical_time: Theoretical arrival time
+        
+    Returns:
+        Created Arrival object
+    """
     arrival = datamodel.Arrival()
     arrival.setPickID(pick.publicID())
     arrival.setPhase(datamodel.Phase(phase))
@@ -158,7 +484,19 @@ def create_arrival(pick, distance_deg, azimuth, phase, config, theoretical_time)
     arrival.setWeight(1.0)
     return arrival
 
-def create_picks_and_arrivals(origin, stations, config):
+def create_picks_and_arrivals(origin: datamodel.Origin, stations: List[Dict[str, Any]], 
+                            config: configparser.ConfigParser) -> Tuple[List[datamodel.Pick], List[datamodel.Arrival], List[str]]:
+    """
+    Create picks and arrivals for an origin using station data.
+    
+    Args:
+        origin: Origin object
+        stations: List of station dictionaries
+        config: Configuration parameters
+        
+    Returns:
+        Tuple containing lists of picks, arrivals, and used station codes
+    """
     picks = []
     arrivals = []
     used_stations = []
@@ -167,16 +505,16 @@ def create_picks_and_arrivals(origin, stations, config):
     model = TauPyModel(model="iasp91")
     
     # Convert depth from meters to kilometers
-    depth_km = origin.depth().value() / 1000
-    print(f"Debug: Origin depth = {depth_km:.2f} km")
+    depth_km = origin.depth().value()
+    logger.debug(f"Origin depth = {depth_km:.2f} km")
     
     max_distance = float(config['QualityParameters']['maximum_distance'])
     min_distance = float(config['Inventory']['min_distance'])
     
-    print(f"Processing {len(stations)} stations")
+    logger.info(f"Processing {len(stations)} stations")
     for idx, station in enumerate(stations):
         if idx % 10 == 0:
-            print(f"Processing station {idx+1}/{len(stations)}")
+            logger.debug(f"Processing station {idx+1}/{len(stations)}")
         distance_deg = station['distance']
         azimuth = station['azimuth']
         
@@ -190,26 +528,39 @@ def create_picks_and_arrivals(origin, stations, config):
         phases_to_pick = ['P', 'S'] if distance_deg <= s_wave_cutoff else ['P']
         
         for phase in phases_to_pick:
-            print(f"Debug: Creating pick for station {station['code']}, phase {phase}, origin depth = {depth_km:.2f} km")
+            logger.debug(f"Creating pick for station {station['code']}, phase {phase}, origin depth = {depth_km:.2f} km")
             pick = create_pick(origin, station, degrees2kilometers(distance_deg), phase, config, depth_km)
             if pick:
                 picks.append(pick)
                 theoretical_arrivals = model.get_travel_times(source_depth_in_km=depth_km,
-                                                             distance_in_degree=distance_deg,
-                                                             phase_list=[phase])
+                                                           distance_in_degree=distance_deg,
+                                                           phase_list=[phase])
                 if theoretical_arrivals:
                     theoretical_time = origin.time().value() + core.TimeSpan(theoretical_arrivals[0].time)
                     arrival = create_arrival(pick, distance_deg, azimuth, phase, config, theoretical_time)
                     arrivals.append(arrival)
     
-    print(f"Created {len(picks)} picks and {len(arrivals)} arrivals for {len(used_stations)} stations")
+    logger.info(f"Created {len(picks)} picks and {len(arrivals)} arrivals for {len(used_stations)} stations")
     return picks, arrivals, used_stations
 
-
-def create_station_magnitudes(origin, magnitude, stations, config, used_stations):
+def create_station_magnitudes(origin: datamodel.Origin, magnitude: datamodel.Magnitude, stations: List[Dict[str, Any]], 
+                            config: configparser.ConfigParser, used_stations: List[str]) -> List[datamodel.StationMagnitude]:
+    """
+    Create station magnitudes for a network magnitude.
+    
+    Args:
+        origin: Origin object
+        magnitude: Network magnitude object
+        stations: List of station dictionaries
+        config: Configuration parameters
+        used_stations: List of station codes used for picks
+        
+    Returns:
+        List of created StationMagnitude objects
+    """
     station_magnitudes = []
     used_stations_set = set(used_stations)
-    print(f"Creating station magnitudes for magnitude type {magnitude.type()}")
+    logger.info(f"Creating station magnitudes for magnitude type {magnitude.type()}")
     
     max_distance = float(config['QualityParameters']['maximum_distance'])
     stations = filter_stations_by_distance(stations, max_distance)
@@ -246,7 +597,7 @@ def create_station_magnitudes(origin, magnitude, stations, config, used_stations
         magnitude.add(contrib)
         station_magnitudes.append(sta_mag)
         
-        print(f"Created station magnitude {sta_mag.magnitude().value():.2f} for station {station['network']}.{station['code']}")
+        logger.debug(f"Created station magnitude {sta_mag.magnitude().value():.2f} for station {station['network']}.{station['code']}")
         
         # Remove the station from the set to ensure it's not used again
         used_stations_set.remove(station['code'])
@@ -255,10 +606,23 @@ def create_station_magnitudes(origin, magnitude, stations, config, used_stations
         if not used_stations_set:
             break
     
-    print(f"Created {len(station_magnitudes)} station magnitudes")
+    logger.info(f"Created {len(station_magnitudes)} station magnitudes")
     return station_magnitudes
 
-def create_multiple_origins(config, event_time, stations, event_depth_km):
+def create_multiple_origins(config: configparser.ConfigParser, event_time: core.Time, stations: List[Dict[str, Any]], 
+                          event_depth_km: float) -> Tuple[List[datamodel.Origin], List[datamodel.Pick], List[List[str]]]:
+    """
+    Create multiple origins for an event with progressive refinement.
+    
+    Args:
+        config: Configuration parameters
+        event_time: Event time
+        stations: List of station dictionaries
+        event_depth_km: Event depth in kilometers
+        
+    Returns:
+        Tuple containing lists of Origins, Picks, and lists of used station codes per origin
+    """
     origins = []
     all_picks = []
     all_used_stations = []
@@ -280,16 +644,16 @@ def create_multiple_origins(config, event_time, stations, event_depth_km):
     # Sort all stations by distance once
     sorted_stations = sorted(stations, key=lambda x: x['distance'])
 
-    print(f"Creating {num_origins} origins")
-    print(f"Total available stations: {len(stations)}")
-    print(f"Stations within distance range {min_distance}-{max_distance}: {len([s for s in stations if min_distance <= s['distance'] <= max_distance])}")
+    logger.info(f"Creating {num_origins} origins")
+    logger.info(f"Total available stations: {len(stations)}")
+    logger.info(f"Stations within distance range {min_distance}-{max_distance}: {len([s for s in stations if min_distance <= s['distance'] <= max_distance])}")
 
     if not stations:
-        print("Warning: No stations available. Check your station inventory and FDSN web service.")
+        logger.warning("No stations available. Check your station inventory and FDSN web service.")
         return [], [], []
 
     for i in range(num_origins):
-        print(f"\nCreating origin {i+1}/{num_origins}")
+        logger.info(f"\nCreating origin {i+1}/{num_origins}")
         origin = datamodel.Origin.Create()
         
         lat_value = lat + np.random.normal(0, float(config['Uncertainties']['origin_latitude']))
@@ -303,7 +667,7 @@ def create_multiple_origins(config, event_time, stations, event_depth_km):
         # Correct depth handling
         depth_value = depth_km + np.random.normal(0, depth_uncertainty_km)
         depth_uncertainty = depth_uncertainty_km * (1 - i/num_origins)
-        origin.setDepth(datamodel.RealQuantity(depth_value, depth_uncertainty))  # Keep in km
+        origin.setDepth(datamodel.RealQuantity(depth_value, depth_uncertainty))  # Convert to meters for SeisComp
         
         origin.setTime(datamodel.TimeQuantity(event_time))
         creation_time = base_creation_time + core.TimeSpan(i * creation_time_increment)
@@ -315,7 +679,7 @@ def create_multiple_origins(config, event_time, stations, event_depth_km):
         origin.setEvaluationMode(datamodel.AUTOMATIC)
         origin.setEvaluationStatus(datamodel.PRELIMINARY)
         
-        print(f"Origin depth: {depth_value:.2f} km")
+        logger.info(f"Origin depth: {depth_value:.2f} km")
         
         # Calculate the number of stations to use for this origin
         num_stations = min(initial_station_count + i * station_increase_per_origin, len(stations))
@@ -329,7 +693,7 @@ def create_multiple_origins(config, event_time, stations, event_depth_km):
         distant_stations = sorted_stations[close_station_count:]
         
         # Randomly select distant stations
-        if distant_station_count > 0:
+        if distant_station_count > 0 and distant_stations:
             distant_stations = random.sample(distant_stations, min(distant_station_count, len(distant_stations)))
         
         stations_to_use = close_stations + distant_stations
@@ -337,21 +701,21 @@ def create_multiple_origins(config, event_time, stations, event_depth_km):
         # Filter stations by distance range
         stations_to_use = [s for s in stations_to_use if min_distance <= s['distance'] <= max_distance]
         
-        print(f"Stations available for this origin: {len(stations_to_use)}")
+        logger.info(f"Stations available for this origin: {len(stations_to_use)}")
         if stations_to_use:
-            print(f"Distance range of used stations: {min([s['distance'] for s in stations_to_use]):.2f} to {max([s['distance'] for s in stations_to_use]):.2f} degrees")
+            logger.info(f"Distance range of used stations: {min([s['distance'] for s in stations_to_use]):.2f} to {max([s['distance'] for s in stations_to_use]):.2f} degrees")
         
         if not stations_to_use:
-            print(f"Warning: No stations available for origin {i+1}. Skipping this origin.")
+            logger.warning(f"Warning: No stations available for origin {i+1}. Skipping this origin.")
             continue
         
         picks, arrivals, used_stations = create_picks_and_arrivals(origin, stations_to_use, config)
-        print(f"Created {len(picks)} picks and {len(arrivals)} arrivals")
+        logger.info(f"Created {len(picks)} picks and {len(arrivals)} arrivals")
         all_picks.extend(picks)
         for arrival in arrivals:
             origin.add(arrival)
         
-        print("Setting origin quality")
+        logger.info("Setting origin quality")
         quality = datamodel.OriginQuality()
         quality.setAssociatedPhaseCount(len(arrivals))
         quality.setUsedPhaseCount(len(arrivals))
@@ -368,19 +732,33 @@ def create_multiple_origins(config, event_time, stations, event_depth_km):
             quality.setMinimumDistance(min(s['distance'] for s in stations_to_use))
             quality.setMedianDistance(np.median([s['distance'] for s in stations_to_use]))
         else:
-            print("Warning: No stations available for setting distance parameters in origin quality.")
+            logger.warning("No stations available for setting distance parameters in origin quality.")
         
         origin.setQuality(quality)
         
         origins.append(origin)
         all_used_stations.append(used_stations)
-        print(f"Finished creating origin {i+1}/{num_origins} using {len(stations_to_use)} stations")
+        logger.info(f"Finished creating origin {i+1}/{num_origins} using {len(stations_to_use)} stations")
 
-    print(f"\nCreated {len(origins)} origins with {len(all_picks)} total picks")
+    logger.info(f"\nCreated {len(origins)} origins with {len(all_picks)} total picks")
     return origins, all_picks, all_used_stations
 
-# Make sure to update the create_magnitudes and create_station_magnitudes functions if necessary
-def create_magnitudes(origin, stations, config, focal_mechanisms, used_stations):
+def create_magnitudes(origin: datamodel.Origin, stations: List[Dict[str, Any]], 
+                    config: configparser.ConfigParser, focal_mechanisms: List[datamodel.FocalMechanism], 
+                    used_stations: List[str]) -> List[datamodel.Magnitude]:
+    """
+    Create network magnitudes for an origin.
+    
+    Args:
+        origin: Origin object
+        stations: List of station dictionaries
+        config: Configuration parameters
+        focal_mechanisms: List of focal mechanism objects
+        used_stations: List of station codes used for picks
+        
+    Returns:
+        List of created Magnitude objects
+    """
     mags = []
     magnitude_config = config['Magnitudes']
     
@@ -401,14 +779,24 @@ def create_magnitudes(origin, stations, config, focal_mechanisms, used_stations)
 
     return mags
 
-
-def create_mww_magnitudes(origins, config):
+def create_mww_magnitudes(origins: List[datamodel.Origin], config: configparser.ConfigParser
+                       ) -> Tuple[List[datamodel.Magnitude], List[datamodel.Origin]]:
+    """
+    Create Mww magnitudes and centroid origins.
+    
+    Args:
+        origins: List of origin objects
+        config: Configuration parameters
+        
+    Returns:
+        Tuple containing lists of Mww magnitudes and centroid origins
+    """
     mww_magnitudes = []
     centroid_origins = []
     mww_values = [float(val.strip()) for val in config['Magnitudes']['Mww'].split(',')]
     
     if len(mww_values) != 3:
-        print("Warning: Expected 3 Mww values in config. Using default values.")
+        logger.warning("Expected 3 Mww values in config. Using default values.")
         mww_values = [8.7, 9.1, 9.3]  # Default values
     
     mww_origins = origins[-3:]  # Use the last three origins for Mww
@@ -426,12 +814,12 @@ def create_mww_magnitudes(origins, config):
         centroid = datamodel.Origin.Create()
         centroid_lat = origin.latitude().value() + random.uniform(-0.1, 0.1)
         centroid_lon = origin.longitude().value() + random.uniform(-0.1, 0.1)
-        centroid_depth = origin.depth().value() + random.uniform(-5, 5)
+        centroid_depth = origin.depth().value() + random.uniform(-5000, 5000)  # In meters
         centroid_time = origin.time().value() + core.TimeSpan(random.uniform(-5, 5))
         
         centroid.setLatitude(datamodel.RealQuantity(centroid_lat, 0.05))
         centroid.setLongitude(datamodel.RealQuantity(centroid_lon, 0.05))
-        centroid.setDepth(datamodel.RealQuantity(centroid_depth, 2.5))
+        centroid.setDepth(datamodel.RealQuantity(centroid_depth, 2500))  # In meters
         centroid.setTime(datamodel.TimeQuantity(centroid_time))
         
         # Set centroid as the derived origin for the Mww magnitude
@@ -439,7 +827,7 @@ def create_mww_magnitudes(origins, config):
         
         # Add centroid information as a comment to Mww magnitude
         centroid_comment = datamodel.Comment()
-        centroid_comment.setText(f"Centroid: Lat={centroid_lat:.4f}, Lon={centroid_lon:.4f}, Depth={centroid_depth:.2f}, Time={centroid_time.toString('%Y-%m-%d %H:%M:%S.%f')}")
+        centroid_comment.setText(f"Centroid: Lat={centroid_lat:.4f}, Lon={centroid_lon:.4f}, Depth={centroid_depth/1000:.2f} km, Time={centroid_time.toString('%Y-%m-%d %H:%M:%S.%f')}")
         mww_mag.add(centroid_comment)
         
         mww_magnitudes.append(mww_mag)
@@ -447,7 +835,19 @@ def create_mww_magnitudes(origins, config):
 
     return mww_magnitudes, centroid_origins
 
-def create_focal_mechanisms(config, origins, event_id):
+def create_focal_mechanisms(config: configparser.ConfigParser, origins: List[datamodel.Origin], event_id: str
+                         ) -> Tuple[List[datamodel.FocalMechanism], List[datamodel.Magnitude], List[datamodel.Origin]]:
+    """
+    Create focal mechanisms, Mww magnitudes, and centroid origins.
+    
+    Args:
+        config: Configuration parameters
+        origins: List of origin objects
+        event_id: Event ID string
+        
+    Returns:
+        Tuple containing lists of focal mechanisms, Mww magnitudes, and centroid origins
+    """
     focal_mechanisms = []
     mww_magnitudes = []
     centroid_origins = []
@@ -456,7 +856,7 @@ def create_focal_mechanisms(config, origins, event_id):
     
     mww_values = [float(val.strip()) for val in config['Magnitudes']['Mww'].split(',')]
     if len(mww_values) != fm_count:
-        print(f"Warning: Expected {fm_count} Mww values in config. Using default values.")
+        logger.warning(f"Expected {fm_count} Mww values in config. Using default values.")
         mww_values = [9.0] * fm_count  # Default value
 
     for i in range(fm_count):
@@ -529,7 +929,21 @@ def create_focal_mechanisms(config, origins, event_id):
     
     return focal_mechanisms, mww_magnitudes, centroid_origins
 
-def create_moment_tensor(config, origin, event_id, index, mw):
+def create_moment_tensor(config: configparser.ConfigParser, origin: datamodel.Origin, event_id: str, 
+                       index: int, mw: float) -> Tuple[datamodel.MomentTensor, datamodel.Magnitude, datamodel.Origin]:
+    """
+    Create a moment tensor and associated objects.
+    
+    Args:
+        config: Configuration parameters
+        origin: Origin object
+        event_id: Event ID string
+        index: Index for the focal mechanism
+        mw: Moment magnitude value
+        
+    Returns:
+        Tuple containing the moment tensor, Mww magnitude, and centroid origin
+    """
     mt = datamodel.MomentTensor.Create()
     agency_id = config['Agency']['id']
     
@@ -557,7 +971,7 @@ def create_moment_tensor(config, origin, event_id, index, mw):
     
     centroid.setLatitude(datamodel.RealQuantity(centroid_lat, 0.05))
     centroid.setLongitude(datamodel.RealQuantity(centroid_lon, 0.05))
-    centroid.setDepth(datamodel.RealQuantity(centroid_depth_km, 2.5))
+    centroid.setDepth(datamodel.RealQuantity(centroid_depth_km , 2500))  # Convert to meters
     centroid.setTime(datamodel.TimeQuantity(centroid_time))
     
     # Set the centroid origin ID for the moment tensor
@@ -582,7 +996,19 @@ def create_moment_tensor(config, origin, event_id, index, mw):
     
     return mt, mag_mww, centroid
 
-def calculate_tensor_components(scalar_moment, strike, dip, rake):
+def calculate_tensor_components(scalar_moment: float, strike: float, dip: float, rake: float) -> datamodel.Tensor:
+    """
+    Calculate moment tensor components from scalar moment and focal mechanism.
+    
+    Args:
+        scalar_moment: Scalar moment value
+        strike: Strike angle in degrees
+        dip: Dip angle in degrees
+        rake: Rake angle in degrees
+        
+    Returns:
+        Tensor object with calculated components
+    """
     s, d, r = np.radians([strike, dip, rake])
     
     mrr = scalar_moment * (np.sin(2*d) * np.sin(r))
@@ -602,7 +1028,17 @@ def calculate_tensor_components(scalar_moment, strike, dip, rake):
     
     return tensor
 
-def calculate_azimuthal_gap(stations, used_stations):
+def calculate_azimuthal_gap(stations: List[Dict[str, Any]], used_stations: List[str]) -> float:
+    """
+    Calculate the azimuthal gap for an origin.
+    
+    Args:
+        stations: List of station dictionaries
+        used_stations: List of station codes used for picks
+        
+    Returns:
+        Azimuthal gap in degrees
+    """
     if not used_stations:
         return 360.0  # Full gap if no stations
     
@@ -616,7 +1052,17 @@ def calculate_azimuthal_gap(stations, used_stations):
     gaps = np.append(gaps, 360 + azimuths[0] - azimuths[-1])
     return np.max(gaps)
 
-def create_synthetic_event(config, seiscomp_config_file):
+def create_synthetic_event(config: configparser.ConfigParser, seiscomp_config_file: str) -> datamodel.EventParameters:
+    """
+    Create a synthetic seismic event with all components.
+    
+    Args:
+        config: Configuration parameters
+        seiscomp_config_file: Path to the SeisComp configuration file
+        
+    Returns:
+        EventParameters object containing the created event
+    """
     ep = datamodel.EventParameters()
 
     agency_id = config['Agency']['id']
@@ -645,240 +1091,247 @@ def create_synthetic_event(config, seiscomp_config_file):
     event_longitude = float(config['Event']['longitude'])
     event_depth_km = float(config['Event']['depth'])
 
-    configured_stations = parse_config_xml(seiscomp_config_file)
-    global_stations = load_stations(config, event_latitude, event_longitude, configured_stations)
-    print(f"Loaded {len(global_stations)} configured stations for event generation")
+    try:
+        configured_stations = parse_config_xml(seiscomp_config_file)
+        global_stations = load_stations(config, event_latitude, event_longitude, configured_stations)
+        logger.info(f"Loaded {len(global_stations)} configured stations for event generation")
 
-    print("Creating multiple origins")
-    origins, picks, all_used_stations = create_multiple_origins(config, event_time, global_stations, event_depth_km)
-    print(f"Created {len(origins)} origins and {len(picks)} picks")
+        if not global_stations:
+            logger.error("No stations could be loaded. Cannot proceed with event generation.")
+            return ep
 
-    if not origins:
-        print("Warning: No origins were created. Cannot proceed with event generation.")
-        return ep
+        logger.info("Creating multiple origins")
+        origins, picks, all_used_stations = create_multiple_origins(config, event_time, global_stations, event_depth_km)
+        logger.info(f"Created {len(origins)} origins and {len(picks)} picks")
 
-    print("Creating focal mechanisms")
-    focal_mechanisms, mww_magnitudes, centroid_origins = create_focal_mechanisms(config, origins, event_id)
-    print(f"Created {len(focal_mechanisms)} focal mechanisms with Mww magnitudes and centroids")
-    
-    print("Adding picks to event parameters")
-    for pick in picks:
-        ep.add(pick)
+        if not origins:
+            logger.warning("No origins were created. Cannot proceed with event generation.")
+            return ep
 
-    print("Adding origins, magnitudes, and arrivals to event parameters")
-    for origin, used_stations in zip(origins, all_used_stations):
-        ep.add(origin)
-        event.add(datamodel.OriginReference(origin.publicID()))
-
-        print(f"Creating magnitudes for origin {origin.publicID()}")
-        mags = create_magnitudes(origin, global_stations, config, focal_mechanisms, used_stations)
-        for mag in mags:
-            origin.add(mag)
-            print(f"Created magnitude: {mag.type()} = {mag.magnitude().value():.2f}")
-
-        print(f"Creating station magnitudes for origin {origin.publicID()}")
-        used_stations_copy = used_stations.copy()
-        for mag in mags:
-            station_magnitudes = create_station_magnitudes(origin, mag, global_stations, config, used_stations_copy)
-            for sta_mag in station_magnitudes:
-                origin.add(sta_mag)
-        print(f"Created {len(station_magnitudes)} station magnitudes for origin {origin.publicID()}")
-
-    if focal_mechanisms:
-        print("Adding focal mechanisms, Mww magnitudes, and centroids to event parameters")
-        for fm, mww_mag, centroid in zip(focal_mechanisms, mww_magnitudes, centroid_origins):
-            ep.add(fm)
-            ep.add(centroid)
-            
-            # Add Mww magnitude to the centroid origin
-            centroid.add(mww_mag)
-            
-            # Create a MomentTensor object if it doesn't exist
-            if fm.momentTensorCount() == 0:
-                mt = datamodel.MomentTensor.Create()
-                fm.add(mt)
-            else:
-                mt = fm.momentTensor(0)
-            
-            # Associate the Mww magnitude with the MomentTensor
-            mt.setMomentMagnitudeID(mww_mag.publicID())
-            
-            # Set the derived origin (centroid) for the moment tensor
-            mt.setDerivedOriginID(centroid.publicID())
-            
-            # Add references to the event
-            event.add(datamodel.FocalMechanismReference(fm.publicID()))
-            event.add(datamodel.OriginReference(centroid.publicID()))
-            
-            # Instead of MagnitudeReference, we set the preferred magnitude ID
-            event.setPreferredMagnitudeID(mww_mag.publicID())
-            
-            print(f"Added focal mechanism {fm.publicID()} with Mww {mww_mag.magnitude().value():.2f}")
-            print(f"  Centroid: Lat={centroid.latitude().value():.4f}, Lon={centroid.longitude().value():.4f}, Depth={centroid.depth().value():.2f} km")
-
-    # Set preferred entities
-    if origins:
-        preferred_origin = origins[-1]
-        event.setPreferredOriginID(preferred_origin.publicID())
-    
-    if mww_magnitudes:
-        event.setPreferredMagnitudeID(mww_magnitudes[-1].publicID())
-    
-    if focal_mechanisms:
-        event.setPreferredFocalMechanismID(focal_mechanisms[-1].publicID())
-
-
-    print(f"\nCreated event with ID: {event.publicID()}")
-    print(f"Preferred Origin ID: {event.preferredOriginID()}")
-    print(f"Preferred Magnitude ID: {event.preferredMagnitudeID()}")
-    print(f"Preferred Focal Mechanism ID: {event.preferredFocalMechanismID()}")
-
-    # Print summary of the preferred origin
-    preferred_origin = ep.findOrigin(event.preferredOriginID())
-    if preferred_origin:
-        print("\nPreferred Origin Summary:")
-        print(f"  Time: {preferred_origin.time().value().toString('%Y-%m-%d %H:%M:%S.%f')}")
-        print(f"  Latitude: {preferred_origin.latitude().value():.4f} ± {preferred_origin.latitude().uncertainty():.4f}")
-        print(f"  Longitude: {preferred_origin.longitude().value():.4f} ± {preferred_origin.longitude().uncertainty():.4f}")
-        print(f"  Depth: {preferred_origin.depth().value():.2f} ± {preferred_origin.depth().uncertainty():.2f} km")
-        print(f"  Evaluation Mode: {preferred_origin.evaluationMode()}")
-        print(f"  Evaluation Status: {preferred_origin.evaluationStatus()}")
+        logger.info("Creating focal mechanisms")
+        focal_mechanisms, mww_magnitudes, centroid_origins = create_focal_mechanisms(config, origins, event_id)
+        logger.info(f"Created {len(focal_mechanisms)} focal mechanisms with Mww magnitudes and centroids")
         
-        print("\n  Magnitudes:")
-        for i in range(preferred_origin.magnitudeCount()):
-            mag = preferred_origin.magnitude(i)
-            print(f"    {mag.type()}: {mag.magnitude().value():.2f} ± {mag.magnitude().uncertainty():.2f}")
-            if mag.type() == "Mww":
-                for j in range(mag.commentCount()):
-                    comment = mag.comment(j)
-                    if comment.text().startswith("Mww solution"):
-                        print(f"      {comment.text()}")
+        logger.info("Adding picks to event parameters")
+        for pick in picks:
+            ep.add(pick)
 
-    # Print summary of the preferred focal mechanism
-    preferred_fm = ep.findFocalMechanism(event.preferredFocalMechanismID())
-    if preferred_fm:
-        print("\nPreferred Focal Mechanism Summary:")
-        print(f"  ID: {preferred_fm.publicID()}")
-        np = preferred_fm.nodalPlanes()
-        if np:
-            np1 = np.nodalPlane1()
-            print(f"  Nodal Plane 1: Strike {np1.strike().value():.1f}° ± {np1.strike().uncertainty():.1f}°, "
-                  f"Dip {np1.dip().value():.1f}° ± {np1.dip().uncertainty():.1f}°, "
-                  f"Rake {np1.rake().value():.1f}° ± {np1.rake().uncertainty():.1f}°")
+        logger.info("Adding origins, magnitudes, and arrivals to event parameters")
+        for origin, used_stations in zip(origins, all_used_stations):
+            ep.add(origin)
+            event.add(datamodel.OriginReference(origin.publicID()))
+
+            logger.info(f"Creating magnitudes for origin {origin.publicID()}")
+            mags = create_magnitudes(origin, global_stations, config, focal_mechanisms, used_stations)
+            for mag in mags:
+                origin.add(mag)
+                logger.info(f"Created magnitude: {mag.type()} = {mag.magnitude().value():.2f}")
+
+            logger.info(f"Creating station magnitudes for origin {origin.publicID()}")
+            used_stations_copy = used_stations.copy()
+            for mag in mags:
+                station_magnitudes = create_station_magnitudes(origin, mag, global_stations, config, used_stations_copy)
+                for sta_mag in station_magnitudes:
+                    origin.add(sta_mag)
+            logger.info(f"Created station magnitudes for origin {origin.publicID()}")
+
+        if focal_mechanisms:
+            logger.info("Adding focal mechanisms, Mww magnitudes, and centroids to event parameters")
+            for fm, mww_mag, centroid in zip(focal_mechanisms, mww_magnitudes, centroid_origins):
+                ep.add(fm)
+                ep.add(centroid)
+                
+                # Add Mww magnitude to the centroid origin
+                centroid.add(mww_mag)
+                
+                # Create a MomentTensor object if it doesn't exist
+                if fm.momentTensorCount() == 0:
+                    mt = datamodel.MomentTensor.Create()
+                    fm.add(mt)
+                else:
+                    mt = fm.momentTensor(0)
+                
+                # Associate the Mww magnitude with the MomentTensor
+                mt.setMomentMagnitudeID(mww_mag.publicID())
+                
+                # Set the derived origin (centroid) for the moment tensor
+                mt.setDerivedOriginID(centroid.publicID())
+                
+                # Add references to the event
+                event.add(datamodel.FocalMechanismReference(fm.publicID()))
+                event.add(datamodel.OriginReference(centroid.publicID()))
+                
+                # Instead of MagnitudeReference, we set the preferred magnitude ID
+                event.setPreferredMagnitudeID(mww_mag.publicID())
+                
+                logger.info(f"Added focal mechanism {fm.publicID()} with Mww {mww_mag.magnitude().value():.2f}")
+                logger.info(f"  Centroid: Lat={centroid.latitude().value():.4f}, Lon={centroid.longitude().value():.4f}, Depth={centroid.depth().value()/1000:.2f} km")
+
+        # Set preferred entities
+        if origins:
+            preferred_origin = origins[-1]
+            event.setPreferredOriginID(preferred_origin.publicID())
         
-        if preferred_fm.momentTensorCount() > 0:
-            mt = preferred_fm.momentTensor(0)
-            print("\n  Moment Tensor:")
-            print(f"    Derived Origin ID: {mt.derivedOriginID()}")
-            tensor = mt.tensor()
-            print(f"    Scalar Moment: {mt.scalarMoment().value():.2e} Nm")
-            print(f"    Double Couple: {mt.doubleCouple():.2f}")
-            print(f"    CLVD: {mt.clvd():.2f}")
-            print(f"    Moment Magnitude ID: {mt.momentMagnitudeID()}")
+        if mww_magnitudes:
+            event.setPreferredMagnitudeID(mww_magnitudes[-1].publicID())
         
-        # Find the associated Mww magnitude
-        centroid_origin = ep.findOrigin(mt.derivedOriginID())
-        if centroid_origin:
-            for i in range(centroid_origin.magnitudeCount()):
-                mag = centroid_origin.magnitude(i)
+        if focal_mechanisms:
+            event.setPreferredFocalMechanismID(focal_mechanisms[-1].publicID())
+
+        logger.info(f"\nCreated event with ID: {event.publicID()}")
+        logger.info(f"Preferred Origin ID: {event.preferredOriginID()}")
+        logger.info(f"Preferred Magnitude ID: {event.preferredMagnitudeID()}")
+        logger.info(f"Preferred Focal Mechanism ID: {event.preferredFocalMechanismID()}")
+
+        # Print summary of the preferred origin
+        preferred_origin = ep.findOrigin(event.preferredOriginID())
+        if preferred_origin:
+            logger.info("\nPreferred Origin Summary:")
+            logger.info(f"  Time: {preferred_origin.time().value().toString('%Y-%m-%d %H:%M:%S.%f')}")
+            logger.info(f"  Latitude: {preferred_origin.latitude().value():.4f} ± {preferred_origin.latitude().uncertainty():.4f}")
+            logger.info(f"  Longitude: {preferred_origin.longitude().value():.4f} ± {preferred_origin.longitude().uncertainty():.4f}")
+            logger.info(f"  Depth: {preferred_origin.depth().value()/1000:.2f} ± {preferred_origin.depth().uncertainty()/1000:.2f} km")
+            logger.info(f"  Evaluation Mode: {preferred_origin.evaluationMode()}")
+            logger.info(f"  Evaluation Status: {preferred_origin.evaluationStatus()}")
+            
+            logger.info("\n  Magnitudes:")
+            for i in range(preferred_origin.magnitudeCount()):
+                mag = preferred_origin.magnitude(i)
+                logger.info(f"    {mag.type()}: {mag.magnitude().value():.2f} ± {mag.magnitude().uncertainty():.2f}")
                 if mag.type() == "Mww":
-                    print(f"\n  Associated Mww Magnitude:")
-                    print(f"    Value: {mag.magnitude().value():.2f} ± {mag.magnitude().uncertainty():.2f}")
-                    print(f"    Method: {mag.methodID()}")
-                    break
-            else:
-                print("\n  No associated Mww magnitude found")
-        else:
-            print("\n  No associated centroid origin found")
+                    for j in range(mag.commentCount()):
+                        comment = mag.comment(j)
+                        if comment.text().startswith("Mww solution"):
+                            logger.info(f"      {comment.text()}")
+    except Exception as e:
+        logger.error(f"Error in event creation: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
 
     return ep
 
-def write_to_xml(ep, filename_prefix):
-    # Get the event ID from the EventParameters object
-    event_id = ep.event(0).publicID() if ep.eventCount() > 0 else "unknown"
+def write_to_xml(ep: datamodel.EventParameters, filename_prefix: str) -> bool:
+    """
+    Write event parameters to an XML file.
     
-    # Create a filename with the event ID
-    filename = f"{filename_prefix}_{event_id}.xml"
-    
-    ar = io.XMLArchive()
-    if not ar.create(filename):
-        print(f"Could not create file: {filename}")
+    Args:
+        ep: EventParameters object
+        filename_prefix: Prefix for the output file name
+        
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        # Get the event ID from the EventParameters object
+        event_id = ep.event(0).publicID() if ep.eventCount() > 0 else "unknown"
+        
+        # Create a filename with the event ID
+        filename = f"{filename_prefix}_{event_id}.xml"
+        
+        ar = io.XMLArchive()
+        if not ar.create(filename):
+            logger.error(f"Could not create file: {filename}")
+            return False
+        ar.setFormattedOutput(True)
+        ar.writeObject(ep)
+        ar.close()
+        logger.info(f"Event has been written to {filename}")
+        return True
+    except Exception as e:
+        logger.error(f"Error writing to XML: {e}")
         return False
-    ar.setFormattedOutput(True)
-    ar.writeObject(ep)
-    ar.close()
-    print(f"Event has been written to {filename}")
-    return True
 
+def parse_args():
+    """
+    Parse command line arguments.
+    
+    Returns:
+        Parsed arguments
+    """
+    parser = argparse.ArgumentParser(description='Seismic Event Generator')
+    parser.add_argument('config_file', type=str, help='Configuration file')
+    parser.add_argument('seiscomp_config_file', type=str, help='SeisComp configuration file')
+    parser.add_argument('--output', type=str, default="synthetic_event_seiscomp", help='Output file prefix')
+    return parser.parse_args()
 
 def main():
-    config = load_config('config.ini')
-
+    """
+    Main function to run the seismic event generator.
+    """
     try:
-        ep = create_synthetic_event(config, 'config.xml')
-        print("Successfully created synthetic event")
+        args = parse_args()
+        
+        # Use ConfigManager for better configuration handling
+        config_manager = ConfigManager(args.config_file)
+        config = config_manager.get_config()
+        
+        logger.info(f"Using configuration file: {args.config_file}")
+        logger.info(f"Using SeisComp configuration file: {args.seiscomp_config_file}")
+        
+        ep = create_synthetic_event(config, args.seiscomp_config_file)
+        logger.info("Successfully created synthetic event")
 
-        # Use a prefix for the output file
-        output_file_prefix = "synthetic_event_seiscomp"
+        # Use the specified or default prefix for the output file
+        output_file_prefix = args.output
         if write_to_xml(ep, output_file_prefix):
-            print("Event has been written to file")
+            logger.info("Event has been written to file")
         else:
-            print("Failed to write event to file")
+            logger.error("Failed to write event to file")
 
         # Print summary of generated event
         for i in range(ep.eventCount()):
             event = ep.event(i)
-            print(f"\nEvent {i+1} Summary:")
-            print(f"ID: {event.publicID()}")
-            print(f"Type: {event.type()}")
-            print(f"Creation Time: {event.creationInfo().creationTime().toString('%Y-%m-%d %H:%M:%S.%f')}")
+            logger.info(f"\nEvent {i+1} Summary:")
+            logger.info(f"ID: {event.publicID()}")
+            logger.info(f"Type: {event.type()}")
+            logger.info(f"Creation Time: {event.creationInfo().creationTime().toString('%Y-%m-%d %H:%M:%S.%f')}")
             
             preferred_origin = ep.findOrigin(event.preferredOriginID())
             if preferred_origin:
-                print("\nPreferred Origin:")
-                print(f"  ID: {preferred_origin.publicID()}")
-                print(f"  Time: {preferred_origin.time().value().toString('%Y-%m-%d %H:%M:%S.%f')}")
-                print(f"  Latitude: {preferred_origin.latitude().value():.4f} ± {preferred_origin.latitude().uncertainty():.4f}")
-                print(f"  Longitude: {preferred_origin.longitude().value():.4f} ± {preferred_origin.longitude().uncertainty():.4f}")
-                print(f"  Depth: {preferred_origin.depth().value():.2f} ± {preferred_origin.depth().uncertainty():.2f} km")
-                print(f"  Evaluation Mode: {preferred_origin.evaluationMode()}")
-                print(f"  Evaluation Status: {preferred_origin.evaluationStatus()}")
+                logger.info("\nPreferred Origin:")
+                logger.info(f"  ID: {preferred_origin.publicID()}")
+                logger.info(f"  Time: {preferred_origin.time().value().toString('%Y-%m-%d %H:%M:%S.%f')}")
+                logger.info(f"  Latitude: {preferred_origin.latitude().value():.4f} ± {preferred_origin.latitude().uncertainty():.4f}")
+                logger.info(f"  Longitude: {preferred_origin.longitude().value():.4f} ± {preferred_origin.longitude().uncertainty():.4f}")
+                logger.info(f"  Depth: {preferred_origin.depth().value()/1000:.2f} ± {preferred_origin.depth().uncertainty()/1000:.2f} km")
+                logger.info(f"  Evaluation Mode: {preferred_origin.evaluationMode()}")
+                logger.info(f"  Evaluation Status: {preferred_origin.evaluationStatus()}")
                 
-                print("\n  Magnitudes:")
+                logger.info("\n  Magnitudes:")
                 for j in range(preferred_origin.magnitudeCount()):
                     magnitude = preferred_origin.magnitude(j)
                     if magnitude.magnitude().uncertainty() is not None:
-                        print(f"    {magnitude.type()}: {magnitude.magnitude().value():.2f} ± {magnitude.magnitude().uncertainty():.2f}")
+                        logger.info(f"    {magnitude.type()}: {magnitude.magnitude().value():.2f} ± {magnitude.magnitude().uncertainty():.2f}")
                     else:
-                        print(f"    {magnitude.type()}: {magnitude.magnitude().value():.2f} (uncertainty not set)")
+                        logger.info(f"    {magnitude.type()}: {magnitude.magnitude().value():.2f} (uncertainty not set)")
             
             preferred_fm = ep.findFocalMechanism(event.preferredFocalMechanismID())
             if preferred_fm:
-                print("\nPreferred Focal Mechanism:")
-                print(f"  ID: {preferred_fm.publicID()}")
-                print(f"  Triggering Origin ID: {preferred_fm.triggeringOriginID()}")
+                logger.info("\nPreferred Focal Mechanism:")
+                logger.info(f"  ID: {preferred_fm.publicID()}")
+                logger.info(f"  Triggering Origin ID: {preferred_fm.triggeringOriginID()}")
                 np = preferred_fm.nodalPlanes()
                 if np:
                     np1 = np.nodalPlane1()
-                    print(f"  Nodal Plane 1: Strike {np1.strike().value():.1f}° ± {np1.strike().uncertainty():.1f}°, "
+                    logger.info(f"  Nodal Plane 1: Strike {np1.strike().value():.1f}° ± {np1.strike().uncertainty():.1f}°, "
                           f"Dip {np1.dip().value():.1f}° ± {np1.dip().uncertainty():.1f}°, "
                           f"Rake {np1.rake().value():.1f}° ± {np1.rake().uncertainty():.1f}°")
                 
                 if preferred_fm.momentTensorCount() > 0:
                     mt = preferred_fm.momentTensor(0)
-                    print("\n  Moment Tensor:")
-                    print(f"    Derived Origin ID: {mt.derivedOriginID()}")
+                    logger.info("\n  Moment Tensor:")
+                    logger.info(f"    Derived Origin ID: {mt.derivedOriginID()}")
                     tensor = mt.tensor()
-                    print(f"    Scalar Moment: {mt.scalarMoment().value():.2e} Nm")
-                    print(f"    Double Couple: {mt.doubleCouple():.2f}")
-                    print(f"    CLVD: {mt.clvd():.2f}")
-                    print(f"    Moment Magnitude ID: {mt.momentMagnitudeID()}")
+                    logger.info(f"    Scalar Moment: {mt.scalarMoment().value():.2e} Nm")
+                    logger.info(f"    Double Couple: {mt.doubleCouple():.2f}")
+                    logger.info(f"    CLVD: {mt.clvd():.2f}")
+                    logger.info(f"    Moment Magnitude ID: {mt.momentMagnitudeID()}")
 
     except Exception as e:
-        print(f"An error occurred: {str(e)}")
-        print("Error details:")
+        logger.error(f"An error occurred: {str(e)}")
+        logger.error("Error details:")
         import traceback
-        traceback.print_exc()
+        logger.error(traceback.format_exc())
 
 if __name__ == "__main__":
     main()
